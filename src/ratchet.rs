@@ -1,5 +1,4 @@
-use base64;
-use hex::FromHex;
+use base64::{self, DecodeError};
 use rand::Rng;
 use sha3::{Digest, Sha3_256};
 use std::error;
@@ -11,47 +10,65 @@ use std::fmt;
 const RATCHET_SIGNIFIER: &str = "uF";
 // number of iterations a previous search can use before
 // ratchets are considered unrelated
-const DEFAULT_PREV_BUDGET: i32 = 1_000_000;
+const DEFAULT_PREV_BUDGET: isize = 1_000_000;
 
-#[derive(Debug, Clone)]
-struct ErrBadLen;
+#[derive(Debug)]
+pub enum RatchetErr {
+    BadLen(usize),
+    BadEncoding(String),
+    UnknownRelation,
+    Decode(DecodeError),
+}
 
-impl fmt::Display for ErrBadLen {
+impl fmt::Display for RatchetErr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "invalid ratchet length")
+        match &*self {
+            RatchetErr::BadLen(i) => write!(f, "invalid ratchet length {}", i),
+            RatchetErr::BadEncoding(s) => write!(
+                f,
+                "unsupported ratched encoding: '{}'. only '{}' is supported",
+                s, RATCHET_SIGNIFIER
+            ),
+            RatchetErr::UnknownRelation => write!(f, "cannot relate ratchets"),
+            RatchetErr::Decode(e) => write!(f, "{:?}", e),
+        }
     }
 }
 
-impl error::Error for ErrBadLen {}
-
-#[derive(Debug, Clone)]
-struct ErrBadEncoding(String);
-
-impl fmt::Display for ErrBadEncoding {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "unsupported ratched encoding: '{}'. only '{}' is supported",
-            self.0, RATCHET_SIGNIFIER
-        )
+impl error::Error for RatchetErr {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match *self {
+            RatchetErr::Decode(ref e) => Some(e),
+            _ => None,
+        }
     }
 }
 
-impl error::Error for ErrBadEncoding {}
-
-#[derive(Debug, Clone)]
-struct ErrUnknownRatchetRelation;
-
-impl fmt::Display for ErrUnknownRatchetRelation {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "cannot relate ratchets")
+impl From<DecodeError> for RatchetErr {
+    fn from(err: DecodeError) -> RatchetErr {
+        RatchetErr::Decode(err)
     }
 }
 
-impl error::Error for ErrUnknownRatchetRelation {}
+#[derive(Debug)]
+pub enum PreviousErr {
+    ExhaustedBudget,
+    EqualRatchets,
+    OlderRatchet,
+}
 
-#[derive(Clone, Copy)]
-struct Spiral {
+impl fmt::Display for PreviousErr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            PreviousErr::ExhaustedBudget => write!(f, "exhausted ratchet discrepency budget"),
+            PreviousErr::EqualRatchets => write!(f, "ratchets are equal"),
+            PreviousErr::OlderRatchet => write!(f, "self ratchet is older than given ratchet"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Spiral {
     large: [u8; 32],
     medium: [u8; 32],
     medium_counter: u8,
@@ -60,7 +77,7 @@ struct Spiral {
 }
 
 impl Spiral {
-    fn new() -> Self {
+    pub fn new() -> Self {
         // 32 bytes for the seed, plus two extra bytes to randomize small & medium starts
         let seed: [u8; 32] = rand::thread_rng().gen::<[u8; 32]>();
         let inc_med = rand::thread_rng().gen::<u8>();
@@ -88,12 +105,12 @@ impl Spiral {
         }
     }
 
-    fn key(self) -> [u8; 32] {
+    pub fn key(self) -> [u8; 32] {
         let v = xor(self.large, xor(self.medium, self.small));
         hash_32(v)
     }
 
-    fn summary(self) -> String {
+    pub fn summary(self) -> String {
         format!(
             "{:?}-{:?}:{:?}-{:?}:{:?}",
             &self.large[0..3],
@@ -103,28 +120,28 @@ impl Spiral {
             &self.small[0..3]
         )
     }
-    //     TODO: test failing, string of incorrect length, string of incorrect length
-    //     fn encode(self) -> String {
-    //         let mut b: [u8; 98] = [0; 98];
-    //         for (i, byte) in self.small.iter().enumerate() {
-    //             b[i] = *byte;
-    //         }
-    //         b[32] = self.small_counter;
-    //         for (i, byte) in self.medium.iter().enumerate() {
-    //             b[i + 32] = *byte;
-    //         }
-    //         b[64] = self.medium_counter;
-    //         for (i, byte) in self.large.iter().enumerate() {
-    //             b[i + 64] = *byte;
-    //         }
-    //         RATCHET_SIGNIFIER.to_owned() + &base64::encode(b).to_owned()
-    //     }
 
-    fn combined_counter(self) -> isize {
-        (265 * self.medium_counter as isize) + self.small_counter as isize
+    pub fn encode(self) -> String {
+        let mut b: [u8; 98] = [0; 98];
+        for (i, byte) in self.small.iter().enumerate() {
+            b[i] = *byte;
+        }
+        b[32] = self.small_counter;
+        for (i, byte) in self.medium.iter().enumerate() {
+            b[i + 33] = *byte;
+        }
+        b[65] = self.medium_counter;
+        for (i, byte) in self.large.iter().enumerate() {
+            b[i + 66] = *byte;
+        }
+        for (i, byte) in b.iter().enumerate() {
+            println!("b[{}]: {}", i, byte);
+        }
+
+        RATCHET_SIGNIFIER.to_owned() + &base64::encode_config(b, base64::URL_SAFE).to_owned()
     }
 
-    fn inc(&mut self) {
+    pub fn inc(&mut self) {
         if self.small_counter >= 255 {
             let (r, _) = next_medium_epoch(*self);
             *self = r;
@@ -134,22 +151,19 @@ impl Spiral {
         self.small_counter += 1;
     }
 
-    fn inc_by(&mut self, n: isize) {
-        let (jumped, _) = inc_by(*self, n);
+    pub fn inc_by(&mut self, n: usize) {
+        let (jumped, _) = inc_by(*self, n as isize);
         *self = jumped;
     }
 
-    fn compare(
-        left: &Self,
-        right: &Spiral,
-        max_steps: &mut isize,
-    ) -> Result<isize, Box<dyn error::Error>> {
-        let left_counter = left.combined_counter();
-        let right_counter = right.combined_counter();
-        if left.large == right.large {
-            if left_counter == right_counter {
+    pub fn compare(self, other: &Spiral, max_steps: usize) -> Result<isize, RatchetErr> {
+        let self_counter = self.combined_counter() as isize;
+        let other_counter = other.combined_counter() as isize;
+        if self.large == other.large {
+            if self_counter == other_counter {
                 return Ok(0);
             }
+            return Ok(self_counter - other_counter);
         }
 
         // here, the large digit always differs, so one of the ratchets will always be bigger,
@@ -157,39 +171,38 @@ impl Spiral {
         // We can find out which one is bigger by hashing both at the same time and looking at
         // when one created the same digit as the other, essentially racing the large digit's
         // recursive hashes.
-        let mut left_large = left.large.clone();
-        let mut right_large = right.large.clone();
-        let mut left_large_counter = 0;
-        let mut right_large_counter = 0;
+        let mut self_large = self.large.clone();
+        let mut other_large = other.large.clone();
+        let mut steps = 0;
+        let mut steps_left = max_steps;
 
         // Since the two ratches might just be generated from a totally different setup, we
         // can never _really_ know which one is the bigger one. They might be unrelated.
-        while *max_steps > 0 {
-            left_large = hash_32(left_large);
-            right_large = hash_32(right_large);
-            left_large_counter += 1;
-            right_large_counter += 1;
+        while steps_left > 0 {
+            self_large = hash_32(self_large);
+            other_large = hash_32(other_large);
+            steps += 1;
 
-            if right_large == left.large {
-                // right_large_counter * 265 * 265 is the count of increments applied via
+            if other_large == self.large {
+                // other_large_counter * 256 * 256 is the count of increments applied via
                 // advancing the large digit continually
-                // -right_large_counter is the difference between 'right' and its next large epoch.
-                // left_counter is just what's left to add because of the count at which 'left' is
-                return Ok(right_large_counter * 265 * 265 - right_counter + left_counter);
+                // -other_large_counter is the difference between 'other' and its next large epoch.
+                // self_counter is just what's self to add because of the count at which 'self' is
+                return Ok((steps * 256 * 256) - (other_counter + self_counter));
             }
 
-            if left_large == right.large {
+            if self_large == other.large {
                 // in this case, we compute the same difference, but return the negative to
-                // indicate that 'right' is bigger that 'left' rather than the other way
+                // indicate that 'other' is bigger that 'self' rather than the other way
                 // around.
-                return Ok(-(left_large_counter * 256 * 256 - left_counter + right_counter));
+                return Ok(-(steps * 256 * 256) - (self_counter + other_counter));
             }
-            *max_steps -= 1;
+            steps_left -= 1;
         }
-        return Err(ErrUnknownRatchetRelation)?;
+        return Err(RatchetErr::UnknownRelation);
     }
 
-    fn equal(&self, right: &Spiral) -> bool {
+    pub fn equal(&self, right: &Spiral) -> bool {
         self.small == right.small
             && self.small_counter == right.small_counter
             && self.medium == right.medium
@@ -199,17 +212,101 @@ impl Spiral {
 
     // known_after is probabilistic. Returns true if self is known to be after b, and false
     // if large counters are inequal (meaning r is before, equal, unrelated, or after)
-    fn known_after(left: Self, right: Spiral) -> bool {
-        left.large == right.large
-            && left.medium_counter > right.medium_counter
-            && left.small_counter > right.small_counter
+    pub fn known_after(self, other: Spiral) -> bool {
+        self.large == other.large
+            && self.medium_counter > other.medium_counter
+            && self.small_counter > other.small_counter
     }
+
+    // This is adapted from the go impl, but doesn't seem to work as intended
+    // examining the typescript impl, looks like a single ratchet should be returned
+    // not a vector (or in go's case, a slice)
+    pub fn previous(self, old: &Spiral, limit: usize) -> Result<Vec<Spiral>, PreviousErr> {
+        return self.previous_budget(old, DEFAULT_PREV_BUDGET, limit);
+    }
+
+    fn previous_budget(
+        self,
+        old: &Spiral,
+        discrepency_budget: isize,
+        limit: usize,
+    ) -> Result<Vec<Spiral>, PreviousErr> {
+        if self.equal(old) {
+            Err(PreviousErr::EqualRatchets)?;
+        } else if self.known_after(*old) {
+            Err(PreviousErr::OlderRatchet)?;
+        }
+        return previous_helper(&self.clone(), old, discrepency_budget, limit);
+    }
+
+    fn combined_counter(self) -> usize {
+        (256 * self.medium_counter as usize) + self.small_counter as usize
+    }
+}
+
+// TODO: this won't work for histories that span the small ratchet
+pub fn previous_helper(
+    recent: &Spiral,
+    old: &Spiral,
+    discrepency_budget: isize,
+    limit: usize,
+) -> Result<Vec<Spiral>, PreviousErr> {
+    if discrepency_budget < 0 {
+        return Err(PreviousErr::ExhaustedBudget);
+    }
+
+    let (old_next_large, old_next_large_steps_done) = next_large_epoch(*old);
+
+    if recent.large == old.large || recent.large == old_next_large.large {
+        let (old_next_medium, old_next_medium_steps_done) = next_medium_epoch(*old);
+
+        if recent.medium == old.medium || recent.medium == old_next_medium.medium {
+            // break out of the recursive pattern at this point because discrepency is
+            // within the small ratchet. working sequentially if faster
+            let mut revision = old.clone();
+            let mut next = old.clone();
+            let mut revisions = vec![*old];
+            next.inc();
+            while !next.equal(recent) {
+                revision.inc();
+                next.inc();
+
+                // duplicate code, also is it nonsense?
+                if revisions.len() == limit && limit > 0 {
+                    // shift all elements by one, keeping slice the same length
+                    let mut r = vec![revision.clone()];
+                    r.extend(&revisions[0..revisions.len() - 1]);
+                    revisions = r;
+                } else {
+                    // push to front
+                    let mut r = vec![revision.clone()];
+                    r.extend(&revisions[1..revisions.len()]);
+                    revisions = r;
+                };
+            }
+            return Ok(revisions);
+        }
+
+        return previous_helper(
+            recent,
+            &old_next_medium,
+            discrepency_budget - old_next_medium_steps_done as isize,
+            limit,
+        );
+    }
+
+    return previous_helper(
+        recent,
+        &old_next_large,
+        discrepency_budget - old_next_large_steps_done as isize,
+        limit,
+    );
 }
 
 fn inc_by(mut r: Spiral, n: isize) -> (Spiral, isize) {
     if n <= 0 {
         return (r, 0);
-    } else if n >= 256 * 256 - r.combined_counter() {
+    } else if n >= 256 * 256 - r.combined_counter() as isize {
         // n is larger than at least one large epoch jump
         let (jumped, jump_count) = next_large_epoch(r);
         return inc_by(jumped, n - jump_count);
@@ -224,7 +321,10 @@ fn inc_by(mut r: Spiral, n: isize) -> (Spiral, isize) {
 }
 
 fn next_large_epoch(r: Spiral) -> (Spiral, isize) {
-    (Spiral::zero(r.large), 256 * 256 - r.combined_counter())
+    (
+        Spiral::zero(r.large),
+        256 * 256 - r.combined_counter() as isize,
+    )
 }
 
 fn next_medium_epoch(r: Spiral) -> (Spiral, isize) {
@@ -240,17 +340,17 @@ fn next_medium_epoch(r: Spiral) -> (Spiral, isize) {
         small_counter: 0,
     };
     let jump_count = jumped.combined_counter() - r.combined_counter();
-    (jumped, jump_count)
+    (jumped, jump_count as isize)
 }
 
-fn decode_spiral(s: String) -> Result<Spiral, Box<dyn error::Error>> {
+pub fn decode_spiral(s: String) -> Result<Spiral, RatchetErr> {
     if s.len() != 133 {
-        Err(ErrBadLen)?
+        return Err(RatchetErr::BadLen(s.len()));
     }
     if &s[0..2] != RATCHET_SIGNIFIER {
-        Err(ErrBadEncoding(s[0..2].to_string()))?
+        return Err(RatchetErr::BadEncoding(s[0..2].to_string()));
     }
-    let d = base64::decode(s)?;
+    let d = base64::decode_config(s, base64::URL_SAFE)?;
 
     let mut s = Spiral {
         small: [0; 32],
@@ -273,14 +373,6 @@ fn decode_spiral(s: String) -> Result<Spiral, Box<dyn error::Error>> {
     Ok(s)
 }
 
-fn shasum_from_hex(s: &str) -> Result<[u8; 32], hex::FromHexError> {
-    <[u8; 32]>::from_hex(s)
-}
-
-fn shasum_to_hex(b: [u8; 32]) -> String {
-    hex::encode(b)
-}
-
 fn hash_32(d: [u8; 32]) -> [u8; 32] {
     let mut hasher = Sha3_256::new();
     hasher.update(d);
@@ -293,7 +385,7 @@ fn hash_32(d: [u8; 32]) -> [u8; 32] {
 }
 
 fn hash_32_n(mut d: [u8; 32], n: u8) -> [u8; 32] {
-    for i in 0..n {
+    for _ in 0..n {
         d = hash_32(d);
     }
     d
@@ -318,6 +410,11 @@ fn compliment(d: [u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hex::FromHex;
+
+    fn shasum_from_hex(s: &str) -> Result<[u8; 32], hex::FromHexError> {
+        <[u8; 32]>::from_hex(s)
+    }
 
     #[test]
     fn test_ratchet() {
@@ -371,6 +468,11 @@ mod tests {
         assert_ratchet_equal(slow, fast);
     }
 
+    // #[test]
+    // fn test_fuzz_ratchet {
+    //     // TODO: research rust fuzz impl
+    // }
+
     #[test]
     fn test_ratchet_add_65536() {
         let seed =
@@ -387,18 +489,104 @@ mod tests {
         assert_ratchet_equal(slow, fast);
     }
 
-    // TODO: test failing, encoding not correct string length
-    // #[test]
-    // fn test_ratchet_encode() {
-    //     let seed =
-    //         shasum_from_hex("600b56e66b7d12e08fd58544d7c811db0063d7aa467a1f6be39990fed0ca5b33")
-    //             .unwrap();
-    //     let a = Spiral::zero(seed);
-    //     let encoded = a.encode();
+    // TODO broken
+    #[test]
+    fn test_ratchet_coding() {
+        let seed =
+            shasum_from_hex("600b56e66b7d12e08fd58544d7c811db0063d7aa467a1f6be39990fed0ca5b33")
+                .unwrap();
+        let a = Spiral::zero(seed);
+        let encoded = a.encode();
 
-    //     let b = decode_spiral(encoded).unwrap();
-    //     assert_ratchet_equal(a, b);
-    // }
+        let b = decode_spiral(encoded).unwrap();
+        assert_ratchet_equal(a, b);
+    }
+
+    #[test]
+    fn test_ratchet_compare() {
+        let one = Spiral::zero(
+            shasum_from_hex("600b56e66b7d12e08fd58544d7c811db0063d7aa467a1f6be39990fed0ca5b33")
+                .unwrap(),
+        );
+        let mut two = one.clone();
+        two.inc();
+        let mut twenty_five_thousand = one.clone();
+        twenty_five_thousand.inc_by(25000);
+
+        let mut one_hundred_thousand = one.clone();
+        one_hundred_thousand.inc_by(100_000);
+
+        let mut temp = one.clone();
+        temp.inc_by(65_536);
+
+        struct Cases<'a> {
+            description: &'a str,
+            a: Spiral,
+            b: Spiral,
+            max_steps: usize,
+            expect: isize,
+        }
+        let mut cases = vec![
+            Cases {
+                description: "comparing same ratchet",
+                a: one,
+                b: one,
+                max_steps: 0,
+                expect: 0,
+            },
+            Cases {
+                description: "ratchet a is one step behind",
+                a: one,
+                b: two,
+                max_steps: 1,
+                expect: -1,
+            },
+            Cases {
+                description: "ratchet a is one step ahead",
+                a: two,
+                b: one,
+                max_steps: 1,
+                expect: 1,
+            },
+            Cases {
+                description: "ratchet a is 25000 steps ahead",
+                a: twenty_five_thousand,
+                b: one,
+                max_steps: 10,
+                expect: 25000,
+            },
+            // 65_533 works, 65_536 does not
+            // 256*256 = 65_536... there is something here
+            //
+            Cases {
+                description: "ratchet a is 65_536 steps behind",
+                a: one,
+                b: temp,
+                max_steps: 10,
+                expect: -65_536,
+            },
+            Cases {
+                description: "ratchet a is 100_000 steps behind",
+                a: one,
+                b: one_hundred_thousand,
+                max_steps: 10,
+                expect: -100_000,
+            },
+        ];
+        for c in cases.iter_mut() {
+            let got =
+                c.a.compare(&c.b, c.max_steps)
+                    .unwrap_or_else(|e| panic!("error in case '{}': {:?}", c.description, e));
+            assert_eq!(c.expect, got);
+        }
+
+        let unrelated = Spiral::zero(
+            shasum_from_hex("500b56e66b7d12e08fd58544d7c811db0063d7aa467a1f6be39990fed0ca5b33")
+                .unwrap(),
+        );
+        // panic if this does not error
+        one.compare(&unrelated, 100_000).unwrap_err();
+    }
 
     #[test]
     fn test_ratchet_equal() {
@@ -421,6 +609,55 @@ mod tests {
 
         if b.equal(&c) {
             panic!("Spiral::equal method incorrectly asserts two unequal ratchets are equal")
+        }
+    }
+
+    #[test]
+    fn test_ratchet_previous() {
+        let increments: [usize; 5] = [1, 2, 2000, 20_000, 300_000];
+        for inc in increments.into_iter() {
+            // TODO refactor so we compute this once & copy for each test
+            let old = Spiral::zero(
+                shasum_from_hex("600b56e66b7d12e08fd58544d7c811db0063d7aa467a1f6be39990fed0ca5b33")
+                    .unwrap(),
+            );
+
+            let mut recent = old.clone();
+            recent.inc_by(inc);
+
+            let mut limit = 5;
+            if inc < limit {
+                limit = inc;
+            }
+
+            let mut expect: Vec<Spiral> = vec![];
+            let mut rev = old.clone();
+            let act_inc = (inc as isize - limit as isize - 1) as usize;
+            print!(
+                "inc {}\nlimit {}\nactual inc {}\n",
+                inc as isize, limit as isize, act_inc
+            );
+            rev.inc_by(act_inc); // fast forward past any elided history
+
+            let mut i = 0;
+            // handle case where history will include original "old" ratchet
+            if limit < 255 && inc < 255 {
+                expect.push(rev.clone());
+                i += 1;
+            }
+            for _ in i..limit {
+                rev.inc();
+                expect.insert(0, rev.clone());
+            }
+
+            let got = match recent.previous(&old, 5) {
+                Ok(g) => g,
+                Err(e) => panic!("error for previous with inc {}: {:?}", inc, e),
+            };
+
+            for (x, g) in expect.into_iter().zip(got.into_iter()).into_iter() {
+                assert_ratchet_equal(x, g);
+            }
         }
     }
 
