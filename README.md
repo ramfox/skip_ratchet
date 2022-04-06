@@ -1,3 +1,7 @@
+DEPRECATED
+
+Please see https://github.com/WebNativeFileSystem/rs-skip-ratchet for latest
+
 rust implementation of skip ratchet
 
 typescript implementation here: 
